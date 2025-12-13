@@ -297,6 +297,46 @@ impl Octree {
         acc
     }
 
+    pub fn closest_at(&self, bodies: &[SimBody], pos: Vec3A) -> Option<(usize, f32)> {
+        let mut min_dist_sq = f32::INFINITY;
+        let mut closest = None;
+
+        let mut node = Self::ROOT;
+        loop {
+            let n = &*self.nodes[node].read();
+
+            let d = n.pos - pos;
+            let d_sq = d.length_squared();
+
+            if n.cube.size() * n.cube.size() < d_sq * self.t_sq {
+                if n.next == 0 {
+                    break;
+                }
+                node = n.next;
+            } else if n.is_leaf() {
+                for i in n.bodies.start..n.bodies.end {
+                    let body = &bodies[i];
+                    let d = body.pos - pos;
+                    let d_sq = d.length_squared();
+
+                    if d_sq != 0.0 && d_sq < min_dist_sq {
+                        min_dist_sq = d_sq;
+                        closest = Some(i);
+                    }
+                }
+
+                if n.next == 0 {
+                    break;
+                }
+                node = n.next;
+            } else {
+                node = n.children;
+            }
+        }
+
+        closest.map(|i| (i, min_dist_sq.sqrt()))
+    }
+
     pub fn force(&self, bodies: &mut [SimBody], grav_const: f32) {
         let bodies_ptr = bodies.as_ptr() as usize;
         let bodies_len = bodies.len();

@@ -205,36 +205,48 @@ impl Simulation {
 
         if dt == 0.0 { return; }
 
+        let y0dt = Vec3A::splat(Y0 * dt);
+        let y1dt = Vec3A::splat(Y1 * dt);
+        let y2dt = Vec3A::splat(Y2 * dt);
+        let y3dt = Vec3A::splat(Y3 * dt);
+
         self.bodies.par_iter_mut().for_each(|body| {
             // Step 1a: r1 = r0 + c2*v0*dt
-            body.pos += body.vel * Y2 * dt;
+            // body.pos += body.vel * Y2 * dt;
+            body.pos = body.vel.mul_add(y2dt, body.pos);
         });
 
         self.calc_forces_accels();
         self.bodies.par_iter_mut().for_each(|body| {
             // Step 1b: v1 = v0 + c1*a(r1)*dt
-            body.vel += body.acc * Y1 * dt;
+            // body.vel += body.acc * Y1 * dt;
+            body.vel = body.acc.mul_add(y1dt, body.vel);
 
             // Step 2a: r2 = r1 + c3*v1*dt
-            body.pos += body.vel * Y3 * dt;
+            // body.pos += body.vel * Y3 * dt;
+            body.pos = body.vel.mul_add(y3dt, body.pos);
         });
 
         self.calc_forces_accels();
         self.bodies.par_iter_mut().for_each(|body| {
             // Step 2b: v2 = v1 + c0*a(r2)*dt
-            body.vel += body.acc * Y0 * dt;
+            // body.vel += body.acc * Y0 * dt;
+            body.vel = body.acc.mul_add(y0dt, body.vel);
 
             // Step 3a: r3 = r2 + c3*v2*dt
-            body.pos += body.vel * Y3 * dt;
+            // body.pos += body.vel * Y3 * dt;
+            body.pos = body.vel.mul_add(y3dt, body.pos);
         });
 
         self.calc_forces_accels();
         self.bodies.par_iter_mut().for_each(|body| {
             // Step 3b: v3 = v2 + c1*a(r3)*dt
-            body.vel += body.acc * Y1 * dt;
+            // body.vel += body.acc * Y1 * dt;
+            body.vel = body.acc.mul_add(y1dt, body.vel);
 
             // Step 4a: r4 = r3 + c2*v3*dt
-            body.pos += body.vel * Y2 * dt;
+            // body.pos += body.vel * Y2 * dt;
+            body.pos = body.vel.mul_add(y2dt, body.pos);
         });
 
         // for body in self.bodies.iter_mut() {
@@ -270,30 +282,49 @@ impl Simulation {
         // }
     }
 
+    // fn resolve_collisions(&mut self) {
+    //     let mut i = 0usize;
+    //     while i < self.bodies.len() {
+    //         let mut max_mass = self.bodies[i].mass;
+    //         let mut max_mass_index = None;
+    //         let mut j = 0usize;
+    //         while j < self.bodies.len() {
+    //             if i != j && self.bodies[i].pos.distance(self.bodies[j].pos) <= (self.bodies[i].radius+self.bodies[j].radius) && self.bodies[j].mass >= max_mass {
+    //                 max_mass = self.bodies[j].mass;
+    //                 max_mass_index.replace(j);
+    //             }
+    //             j += 1;
+    //         }
+
+    //         if let Some(j) = max_mass_index {
+    //             self.combine(j, i);
+    //             continue; // Body i has been removed so dont skip ahead
+    //         }
+
+    //         i += 1;
+    //     }
+    // }
+
     fn resolve_collisions(&mut self) {
-        let mut i = 0usize;
-        while i < self.bodies.len() {
-            let mut max_mass = self.bodies[i].mass;
-            let mut max_mass_index = None;
-            let mut j = 0usize;
-            while j < self.bodies.len() {
-                if i != j && self.bodies[i].pos.distance(self.bodies[j].pos) <= (self.bodies[i].radius+self.bodies[j].radius) && self.bodies[j].mass >= max_mass {
-                    max_mass = self.bodies[j].mass;
-                    max_mass_index.replace(j);
+        let (sender, reciever) = crossbeam::channel::unbounded();
+        self.octree.build(&mut self.bodies);
+        self.bodies.par_iter().enumerate().for_each(|(i, body)| {
+            if let Some((j, dist)) = self.octree.closest_at(&self.bodies, body.pos) {
+                let other = &self.bodies[j];
+                if dist <= body.radius+other.radius && other.mass >= body.mass {
+                    sender.send((j, i)).unwrap();
                 }
-                j += 1;
             }
+        });
 
-            if let Some(j) = max_mass_index {
-                self.combine(j, i);
-                continue; // Body i has been removed so dont skip ahead
-            }
+        drop(sender);
 
-            i += 1;
+        for (j, i) in reciever.iter() {
+            self.combine(j, i);
         }
     }
 
-    pub fn step(&mut self, mut dt: f32, max_step: f32) {
+    pub fn step(&mut self, dt: f32, _max_step: f32) {
         // while dt > max_step {
         //     self.leapfrog_integrate(max_step);
         //     dt -= max_step;
