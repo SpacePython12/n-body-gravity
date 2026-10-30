@@ -1,27 +1,40 @@
-use std::{ops::Range, sync::atomic::{AtomicUsize, Ordering}};
+use std::{
+    collections::HashSet,
+    num::NonZero,
+    ops::Range,
+    sync::{Arc, Weak, atomic::AtomicUsize},
+};
 
-use glam::*;
+use rayon::iter::{IntoParallelIterator, ParallelExtend, ParallelIterator};
+use thunderdome::{Arena, Index};
 
-use parking_lot::RwLock;
-use rayon::prelude::*;
+use crate::{math::*, sim::Body};
 
-use crate::sim::SimBody;
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Cube(Vec4);
 
-#[derive(Clone, Copy)]
-struct Cube(Vec4);
+impl Default for Cube {
+    fn default() -> Self {
+        Self::ZEROED
+    }
+}
 
 impl Cube {
     pub const ZEROED: Self = Self(Vec4::ZERO);
 
-    pub fn new_containing(bodies: &[SimBody]) -> Self {
+    pub fn new_containing(points: impl Iterator<Item = Vec3A>) -> Self {
         let mut min = Vec3A::MAX;
         let mut max = Vec3A::MIN;
 
-        for body in bodies {
-            min = min.min(body.pos);
-            max = max.max(body.pos);
+        for point in points {
+            min = min.min(point);
+            max = max.max(point);
         }
 
+        Self::new_min_max(min, max)
+    }
+
+    pub fn new_min_max(min: Vec3A, max: Vec3A) -> Self {
         let center = (min + max) * 0.5;
         let size = (max - min).max_element();
 
@@ -36,354 +49,357 @@ impl Cube {
         self.0.w
     }
 
-    pub fn into_quadrant(&self, quadrant: BVec3A) -> Self {
+    pub fn into_octant(&self, octant: BVec3A) -> Self {
         const HALF: Vec3A = Vec3A::splat(0.5);
         const NEG_HALF: Vec3A = Vec3A::splat(-0.5);
         let size = self.size() * 0.5;
-        let center = self.center() + Vec3A::select(quadrant, HALF, NEG_HALF) * size;
+        let center = self.center() + Vec3A::select(octant, HALF, NEG_HALF) * size;
         Self(center.extend(size))
     }
 
     pub fn subdivide(&self) -> [Cube; 8] {
         [
-            self.into_quadrant(BVec3A::new(false, false, false)),
-            self.into_quadrant(BVec3A::new(true,  false, false)),
-            self.into_quadrant(BVec3A::new(false, true,  false)),
-            self.into_quadrant(BVec3A::new(true,  true,  false)),
-            self.into_quadrant(BVec3A::new(false, false, true )),
-            self.into_quadrant(BVec3A::new(true,  false, true )),
-            self.into_quadrant(BVec3A::new(false, true,  true )),
-            self.into_quadrant(BVec3A::new(true,  true,  true )),
+            self.into_octant(BVec3A::new(false, false, false)),
+            self.into_octant(BVec3A::new(true, false, false)),
+            self.into_octant(BVec3A::new(false, true, false)),
+            self.into_octant(BVec3A::new(true, true, false)),
+            self.into_octant(BVec3A::new(false, false, true)),
+            self.into_octant(BVec3A::new(true, false, true)),
+            self.into_octant(BVec3A::new(false, true, true)),
+            self.into_octant(BVec3A::new(true, true, true)),
         ]
     }
+
+    pub fn contains(&self, point: Vec3A) -> bool {
+        let center = self.center();
+        let hi_bound = center + self.size() * 0.5;
+        let lo_bound = center - self.size() * 0.5;
+
+        (point.cmple(hi_bound) & point.cmpge(lo_bound)).all()
+    }
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 struct Node {
-    pub children: usize,
-    pub next: usize,
-    pub pos: Vec3A,
-    pub mass: f32,
-    pub cube: Cube,
-    pub bodies: Range<usize>
+    parent: usize,
+    children: Option<NonZero<usize>>,
+    next: Option<NonZero<usize>>,
+    bounds: Cube,
+    center_of_mass: Vec3A,
+    total_mass: f32,
+    body: Option<Index>,
 }
 
-impl Node {
-    pub const ZEROED: Self = Self {
-        children: 0,
-        next: 0,
-        pos: Vec3A::ZERO,
-        mass: 0.0,
-        cube: Cube::ZEROED,
-        bodies: 0..0,
-    };
-
-    pub fn new(next: usize, cube: Cube, bodies: Range<usize>) -> Self {
-        Self {
-            children: 0,
-            next,
-            pos: Vec3A::ZERO,
-            mass: 0.0,
-            cube,
-            bodies
-        }
-    }
-
-    pub fn is_leaf(&self) -> bool {
-        self.children == 0
-    }
-}
-
-
+#[derive(Debug, Clone, PartialEq)]
 pub struct Octree {
-    t_sq: f32,
-    e_sq: f32,
-    leaf_capacity: usize,
-    thread_capacity: usize,
-    atomic_len: AtomicUsize,
-    nodes: Vec<RwLock<Node>>,
-    parents: Vec<AtomicUsize>,
+    pub g: f32,
+    pub t_sq: f32,
+    pub e_sq: f32,
+    nodes: Vec<Node>,
+    bodies: Vec<Index>,
 }
 
 impl Octree {
-    pub const ROOT: usize = 0;
-
-    pub fn new(theta: f32, epsilon: f32, leaf_capacity: usize, thread_capacity: usize) -> Self {
+    pub fn new(grav_const: f32, theta: f32, epsilon: f32) -> Self {
         Self {
+            g: grav_const,
             t_sq: theta * theta,
             e_sq: epsilon * epsilon,
-            leaf_capacity,
-            thread_capacity,
-            atomic_len: AtomicUsize::new(0),
             nodes: Vec::new(),
-            parents: Vec::new(),
+            bodies: Vec::new(),
         }
     }
 
-    pub fn clear(&mut self) {
-        self.atomic_len.store(0, Ordering::Relaxed);
-    }
+    /// O(n*log(n)) because of sort
+    fn subdivide_if_needed<'a>(
+        index: usize,
+        count: &AtomicUsize,
+        node: &mut Node,
+        handles: &'a mut [Index],
+        positions: &[Vec3A],
+    ) -> Option<[(usize, Node, &'a mut [Index]); 8]> {
+        let center = node.bounds.center();
 
-    fn subdivide(&self, index: usize, node: &mut parking_lot::RwLockUpgradableReadGuard<Node>, bodies: &mut [SimBody], range: Range<usize>) -> usize {
-        let center = node.cube.center();
+        if handles.len() <= 1 {
+            if let Some(&handle) = handles.first() {
+                node.body = Some(handle);
+            }
+            return None;
+        }
 
-        let mut split = [range.start, 0, 0, 0, 0, 0, 0, 0, range.end];
+        handles.sort_unstable_by_key(|handle| {
+            positions[handle.slot() as usize].cmpgt(center).bitmask()
+        });
 
-        let predicate = |body: &SimBody| body.pos.z < center.z;
-        split[4] = split[0] + bodies[split[0]..split[8]].partition(predicate);
+        let predicate = |handle: &Index| positions[handle.slot() as usize].z <= center.z;
+        let (lz, gz) = handles.split_at_mut(handles.partition_point(&predicate));
 
-        let predicate = |body: &SimBody| body.pos.y < center.y;
-        split[2] = split[0] + bodies[split[0]..split[4]].partition(predicate);
-        split[6] = split[4] + bodies[split[4]..split[8]].partition(predicate);
+        let predicate = |handle: &Index| positions[handle.slot() as usize].y <= center.y;
+        let (lz_ly, lz_gy) = lz.split_at_mut(lz.partition_point(&predicate));
+        let (gz_ly, gz_gy) = gz.split_at_mut(gz.partition_point(&predicate));
 
-        let predicate = |body: &SimBody| body.pos.x < center.x;
-        split[1] = split[0] + bodies[split[0]..split[2]].partition(predicate);
-        split[3] = split[2] + bodies[split[2]..split[4]].partition(predicate);
-        split[5] = split[4] + bodies[split[4]..split[6]].partition(predicate);
-        split[7] = split[6] + bodies[split[6]..split[8]].partition(predicate);
+        let predicate = |handle: &Index| positions[handle.slot() as usize].x <= center.x;
+        let (lz_ly_lx, lz_ly_gx) = lz_ly.split_at_mut(lz_ly.partition_point(&predicate));
+        let (lz_gy_lx, lz_gy_gx) = lz_gy.split_at_mut(lz_gy.partition_point(&predicate));
+        let (gz_ly_lx, gz_ly_gx) = gz_ly.split_at_mut(gz_ly.partition_point(&predicate));
+        let (gz_gy_lx, gz_gy_gx) = gz_gy.split_at_mut(gz_gy.partition_point(&predicate));
 
-        let len = self.atomic_len.fetch_add(1, Ordering::Relaxed);
-        let children = len * 8 + 1;
-        self.parents[len].store(index, Ordering::Relaxed);
-        node.with_upgraded(|node| node.children = children);
+        let base = count.fetch_add(8, std::sync::atomic::Ordering::Relaxed);
+
+        let mut ranges = [
+            lz_ly_lx, lz_ly_gx, lz_gy_lx, lz_gy_gx, gz_ly_lx, gz_ly_gx, gz_gy_lx, gz_gy_gx,
+        ];
+
+        let octants = node.bounds.subdivide();
+
+        node.children = NonZero::new(base);
 
         let nexts = [
-            children + 1,
-            children + 2,
-            children + 3,
-            children + 4,
-            children + 5,
-            children + 6,
-            children + 7,
+            NonZero::new(base + 1),
+            NonZero::new(base + 2),
+            NonZero::new(base + 3),
+            NonZero::new(base + 4),
+            NonZero::new(base + 5),
+            NonZero::new(base + 6),
+            NonZero::new(base + 7),
             node.next,
         ];
-        let cubes = node.cube.subdivide();
-        for i in 0..8 {
-            let bodies = split[i]..split[i + 1];
-            *self.nodes[children + i].write() = Node::new(nexts[i], cubes[i], bodies);
-        }
 
-        children
+        Some(std::array::from_fn(move |i| {
+            (
+                base + i,
+                Node {
+                    parent: index,
+                    children: None,
+                    next: nexts[i],
+                    bounds: octants[i],
+                    center_of_mass: octants[i].center(),
+                    total_mass: 0.0,
+                    body: None,
+                },
+                std::mem::replace(&mut ranges[i], &mut []),
+            )
+        }))
     }
 
-    pub fn build(&mut self, bodies: &mut [SimBody]) {
-        self.clear();
-
-        let new_len = 8 * bodies.len();
-        self.nodes.resize_with(new_len, || RwLock::new(Node::ZEROED));
-        self.parents.resize_with(new_len / 8, || AtomicUsize::new(0));
-
-        let cube = Cube::new_containing(bodies);
-        *self.nodes[Self::ROOT].get_mut() = Node::new(0, cube, 0..bodies.len());
-
-        let (tx, rx) = crossbeam::channel::unbounded();
-        tx.send(Self::ROOT).unwrap();
-
-        let octree_ptr = &*self;
-        let bodies_ptr = bodies.as_ptr() as usize;
-        let bodies_len = bodies.len();
-
-        let counter = AtomicUsize::new(0);
-        rayon::broadcast(|_| {
-            let mut stack = Vec::new();
-            let octree = octree_ptr;
-            let bodies =
-                unsafe { std::slice::from_raw_parts_mut(bodies_ptr as *mut SimBody, bodies_len) };
-
-            while counter.load(Ordering::Relaxed) != bodies.len() {
-                while let Ok(node) = rx.try_recv() {
-                    let mut node_lock = octree.nodes[node].upgradable_read();
-                    let range = node_lock.bodies.clone();
-
-                    if range.len() >= octree.thread_capacity {
-                        let children = octree.subdivide(node, &mut node_lock, bodies, range);
-                        for i in 0..8 {
-                            if !self.nodes[children + i].read().bodies.is_empty() {
-                                tx.send(children + i).unwrap();
-                            }
-                        }
-                        continue;
-                    }
-
-                    counter.fetch_add(range.len(), Ordering::Relaxed);
-
-                    drop(node_lock);
-
-                    stack.push(node);
-                    while let Some(node) = stack.pop() {
-                        let mut node_lock = octree.nodes[node].upgradable_read();
-                        let range = node_lock.bodies.clone();
-                        if range.len() <= octree.leaf_capacity {
-                            let pos = bodies[range.clone()].iter().map(|b| b.pos * b.mass).sum();
-                            let mass = bodies[range.clone()].iter().map(|b| b.mass).sum();
-                            node_lock.with_upgraded(|node| {
-                                node.pos = pos;
-                                node.mass = mass;
-                            });
-                            continue;
-                        }
-                        let children = octree.subdivide(node, &mut node_lock, bodies, range);
-                        for i in 0..8 {
-                            if !self.nodes[children + i].read().bodies.is_empty() {
-                                stack.push(children + i);
-                            }
-                        }
-                    }
+    /// O(n)
+    fn propogate(&mut self, positions: &[Vec3A], masses: &[f32]) {
+        for node in (0..self.nodes.len()).rev() {
+            let mut center_of_mass = Vec3A::ZERO;
+            let mut total_mass = 0.0f32;
+            if let Some(children) = self.nodes[node].children {
+                let children = children.get();
+                for child in children..children + 8 {
+                    let mass = self.nodes[child].total_mass;
+                    center_of_mass += self.nodes[child].center_of_mass * mass;
+                    total_mass += mass;
                 }
-            }
-        });
-
-        self.propagate();
-    }
-
-    fn propagate(&mut self) {
-        let len = self.atomic_len.load(Ordering::Relaxed);
-        for index in self.parents.iter().rev() {
-            let index = index.load(Ordering::Relaxed);
-            let i = self.nodes[index].get_mut().children;
-
-            self.nodes[index].get_mut().pos = Vec3A::ZERO;
-            self.nodes[index].get_mut().mass = 0.0;
-            for child in i..i+8 {
-                let pos = self.nodes[child].get_mut().pos;
-                let mass = self.nodes[child].get_mut().mass;
-                self.nodes[index].get_mut().pos += pos;
-                self.nodes[index].get_mut().mass += mass;
-            }
-        }
-        self.nodes[0..len * 8 + 1].par_iter_mut().for_each(|node| {
-            let mass = node.get_mut().mass.max(f32::MIN_POSITIVE);
-            node.get_mut().pos /= mass;
-        });
-    }
-
-    pub fn force_at(&self, bodies: &[SimBody], pos: Vec3A, mass: f32, grav_const: f32) -> Vec3A {
-        let mut acc = Vec3A::ZERO;
-
-        let mut node = Self::ROOT;
-        loop {
-            let n = &*self.nodes[node].read();
-
-            let d = n.pos - pos;
-            let d_sq = d.length_squared();
-
-            if n.cube.size() * n.cube.size() < d_sq * self.t_sq {
-                let denom = (d_sq + self.e_sq) * d_sq.sqrt();
-                acc += d * (grav_const * mass * n.mass / denom);
-
-                if n.next == 0 {
-                    break;
-                }
-                node = n.next;
-            } else if n.is_leaf() {
-                for i in n.bodies.start..n.bodies.end {
-                    let body = &bodies[i];
-                    let d = body.pos - pos;
-                    let d_sq = d.length_squared();
-
-                    let denom = (d_sq + self.e_sq) * d_sq.sqrt();
-                    acc += d * (grav_const * mass * body.mass / denom).min(f32::MAX);
-                }
-
-                if n.next == 0 {
-                    break;
-                }
-                node = n.next;
             } else {
-                node = n.children;
+                if let Some(handle) = self.nodes[node].body {
+                    let mass = masses[handle.slot() as usize];
+                    center_of_mass = positions[handle.slot() as usize] * mass;
+                    total_mass = mass;
+                }
+            }
+
+            self.nodes[node].center_of_mass = if total_mass > 0.0 {
+                center_of_mass / total_mass
+            } else {
+                self.nodes[node].bounds.center()
+            };
+            self.nodes[node].total_mass = total_mass;
+        }
+    }
+
+    pub fn is_built(&self) -> bool {
+        !self.nodes.is_empty()
+    }
+
+    pub fn invalidate(&mut self) {
+        self.nodes.clear();
+    }
+
+    pub fn build(&mut self, indexes: &HashSet<Index>, positions: &[Vec3A], masses: &[f32]) {
+        self.invalidate();
+        let mut handles = std::mem::take(&mut self.bodies);
+        handles.clear();
+        handles.par_extend(indexes);
+
+        let (min_bound, max_bound) = indexes
+            .into_par_iter()
+            .fold(
+                || (Vec3A::MAX, Vec3A::MIN),
+                |(min, max), handle| {
+                    let position = positions[handle.slot() as usize];
+                    (min.min(position), max.max(position))
+                },
+            )
+            .reduce(
+                || (Vec3A::MAX, Vec3A::MIN),
+                |(min_a, max_a), (min_b, max_b)| (min_a.min(min_b), max_a.max(max_b)),
+            );
+        let bounds = Cube::new_min_max(min_bound, max_bound);
+
+        let count = Arc::new(AtomicUsize::new(1));
+        let processing = Arc::new(AtomicUsize::new(1));
+        let (job_sender, job_reciever) = crossbeam::channel::unbounded();
+
+        job_sender
+            .send((
+                0usize,
+                Node {
+                    parent: 0,
+                    children: None,
+                    next: None,
+                    bounds,
+                    center_of_mass: bounds.center(),
+                    total_mass: 0.0,
+                    body: None,
+                },
+                handles.as_mut_slice(),
+            ))
+            .unwrap();
+
+        let nodes = rayon::broadcast(|_| {
+            let mut nodes = Vec::new();
+            let processing = processing.clone();
+            let count = count.clone();
+            while processing.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+                while let Ok((index, mut node, handles)) = job_reciever.try_recv() {
+                    if let Some(results) =
+                        Self::subdivide_if_needed(index, &count, &mut node, handles, positions)
+                    {
+                        for results in results {
+                            job_sender.send(results).unwrap();
+                        }
+                        processing.fetch_add(8, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    nodes.push((index, node));
+                    processing.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+            nodes
+        });
+
+        assert!(job_reciever.len() == 0, "not all jobs processed");
+        assert!(
+            processing.load(std::sync::atomic::Ordering::Relaxed) == 0,
+            "processing should be 0"
+        );
+
+        self.nodes.resize(
+            count.load(std::sync::atomic::Ordering::Relaxed),
+            Node::default(),
+        );
+        nodes.into_iter().flatten().for_each(|(index, node)| {
+            self.nodes[index] = node;
+        });
+
+        self.propogate(positions, masses);
+    }
+
+    pub fn accel_at(&self, pos: Vec3A) -> Vec3A {
+        assert!(self.is_built(), "Octree was queried before it was built!");
+        let mut total_accel = Vec3A::ZERO;
+
+        let mut index = 0usize;
+        loop {
+            let node = &self.nodes[index];
+
+            let dist = node.center_of_mass - pos;
+            let dist_sq = dist.length_squared();
+            let node_mass = node.total_mass;
+
+            if node.bounds.size() * node.bounds.size() < dist_sq * self.t_sq {
+                if dist_sq > 0.0 {
+                    let denom = (dist_sq + self.e_sq) * dist_sq.sqrt();
+                    let accel = dist * (self.g * node_mass / denom);
+                    // println!(
+                    //     "Applied indirect accel {} to mass from {} to {}",
+                    //     accel,
+                    //     dist + pos,
+                    //     pos
+                    // );
+
+                    total_accel += accel;
+                }
+
+                if let Some(i) = node.next {
+                    index = i.get();
+                } else {
+                    break;
+                }
+            } else if node.children.is_none() {
+                if let Some(handle) = node.body {
+                    // let body = &bodies[handle];
+                    // let dist = body.position() - pos;
+                    // let dist_sq = dist.length_squared();
+                    // let node_mass = node.total_mass;
+
+                    if dist_sq > 1.0e-5 && !node.bounds.contains(pos) {
+                        let denom = (dist_sq + self.e_sq) * dist_sq.sqrt();
+                        let accel = dist * (self.g * node_mass / denom);
+                        // println!(
+                        //     "Applied direct accel {} to mass  from {} to {} ({})",
+                        //     accel,
+                        //     dist + pos,
+                        //     pos,
+                        //     node_mass
+                        // );
+                        total_accel += accel;
+                    }
+                }
+
+                if let Some(i) = node.next {
+                    index = i.get();
+                } else {
+                    break;
+                }
+            } else {
+                if let Some(i) = node.children {
+                    assert!(self.nodes[i.get()].parent == index);
+                    index = i.get();
+                } else {
+                    break;
+                }
             }
         }
 
-        acc
+        total_accel
     }
 
-    pub fn closest_at(&self, bodies: &[SimBody], pos: Vec3A) -> Option<(usize, f32)> {
-        let mut min_dist_sq = f32::INFINITY;
+    pub fn force_at(&self, pos: Vec3A, mass: f32) -> Vec3A {
+        self.accel_at(pos) * mass
+    }
+
+    pub fn closest_at(&self, pos: Vec3A, exclude: Option<Index>) -> Option<(Index, f32)> {
+        assert!(self.is_built(), "Octree was queried before it was built!");
+        let mut closest_dist = f32::INFINITY;
         let mut closest = None;
 
-        let mut node = Self::ROOT;
+        let mut index = 0usize;
         loop {
-            let n = &*self.nodes[node].read();
+            let node = &self.nodes[index];
 
-            let d = n.pos - pos;
-            let d_sq = d.length_squared();
-
-            if n.cube.size() * n.cube.size() < d_sq * self.t_sq {
-                if n.next == 0 {
-                    break;
-                }
-                node = n.next;
-            } else if n.is_leaf() {
-                for i in n.bodies.start..n.bodies.end {
-                    let body = &bodies[i];
-                    let d = body.pos - pos;
-                    let d_sq = d.length_squared();
-
-                    if d_sq != 0.0 && d_sq < min_dist_sq {
-                        min_dist_sq = d_sq;
-                        closest = Some(i);
+            if let Some(children) = node.children {
+                index = children.get();
+            } else {
+                if let Some(handle) = node.body {
+                    let dist = pos.distance_squared(node.center_of_mass);
+                    if dist < closest_dist && Some(handle) != exclude {
+                        closest_dist = dist;
+                        closest.replace(handle);
                     }
                 }
 
-                if n.next == 0 {
+                if let Some(next) = node.next {
+                    index = next.get()
+                } else {
                     break;
                 }
-                node = n.next;
-            } else {
-                node = n.children;
             }
         }
 
-        closest.map(|i| (i, min_dist_sq.sqrt()))
-    }
-
-    pub fn force(&self, bodies: &mut [SimBody], grav_const: f32) {
-        let bodies_ptr = bodies.as_ptr() as usize;
-        let bodies_len = bodies.len();
-
-        bodies.par_iter_mut().for_each(|body| {
-            let bodies = unsafe { std::slice::from_raw_parts(bodies_ptr as *const SimBody, bodies_len) };
-            body.acc = self.force_at(bodies, body.pos, body.mass, grav_const) / body.mass;
-        });
-    }
-}
-
-pub trait Partition<T> {
-    /// Partitions self in place so that all elements for which the `predicate`
-    /// returns `true` are positioned before all elements for which it returns `false`.
-    ///
-    /// The function returns the index of the first element for which `predicate` returns `false`.
-    fn partition<F>(&mut self, predicate: F) -> usize
-    where
-        F: Fn(&T) -> bool;
-}
-
-impl<T> Partition<T> for [T] {
-    fn partition<F>(&mut self, predicate: F) -> usize
-    where
-        F: Fn(&T) -> bool,
-    {
-        if self.is_empty() {
-            return 0;
-        }
-
-        let mut l = 0;
-        let mut r = self.len() - 1;
-
-        loop {
-            while l <= r && predicate(&self[l]) {
-                l += 1;
-            }
-            while l < r && !predicate(&self[r]) {
-                r -= 1;
-            }
-            if l >= r {
-                return l;
-            }
-
-            self.swap(l, r);
-            l += 1;
-            r -= 1;
-        }
+        closest.map(|handle| (handle, closest_dist.sqrt()))
     }
 }

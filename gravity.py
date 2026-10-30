@@ -43,7 +43,7 @@ class GravitySimulation:
         self.cog_velocity = np.zeros(3, dtype=np.float32)
 
 
-        
+
         self.w_dirs = np.empty_like(self.vector_temp)
         self.p_dirs = np.empty_like(self.vector_temp)
         self.q_dirs = np.empty_like(self.vector_temp)
@@ -52,7 +52,7 @@ class GravitySimulation:
 
 
 
-    # Take sum of all forces by all bodies 
+    # Take sum of all forces by all bodies
     def calc_forces_accels(self):
         # Compute displacements
         np.copyto(self.idisps, np.reshape(self.positions, (1, self.count, 3)))
@@ -60,7 +60,7 @@ class GravitySimulation:
 
         # Copy displacements to forces
         np.copyto(self.iforces, self.idisps)
-        
+
         # Take self dot product of displacements and get distance cubed
         self.idisps *= self.idisps
         np.sum(self.idisps, axis=2, out=self.idists)
@@ -70,7 +70,7 @@ class GravitySimulation:
         with np.errstate(divide='ignore', invalid='ignore'): # Ignore divide by zero
             self.iforces /= np.reshape(self.idists, (self.count, self.count, 1))
 
-        # Set diagonal to zero to remove NaNs 
+        # Set diagonal to zero to remove NaNs
         # self.iforces[self.idiag] = (0.0, 0.0, 0.0)
 
         # Remove NaNs
@@ -148,13 +148,13 @@ class GravitySimulation:
     def euler_integrate(self, dt: float):
         self.calc_forces_accels()
 
-        np.copyto(self.vector_temp, self.velocities)
-        self.vector_temp *= dt
-        self.positions += self.vector_temp
-
         np.copyto(self.vector_temp, self.accels)
         self.vector_temp *= dt
         self.velocities += self.vector_temp
+
+        np.copyto(self.vector_temp, self.velocities)
+        self.vector_temp *= dt
+        self.positions += self.vector_temp
 
         self.vector_temp *= dt * 0.5
         self.positions += self.vector_temp
@@ -226,8 +226,8 @@ class GravitySimulation:
         orbit_parameter = self.orbit_parameter(i)
         distance = orbit_parameter / (1 + self.eccs[i, :] * cos)
         return np.reshape(distance, (len(v), 1)) * (
-            np.reshape(self.p_dirs[i, :], (1, 3)) * np.reshape(cos, (len(v), 1)) 
-            + 
+            np.reshape(self.p_dirs[i, :], (1, 3)) * np.reshape(cos, (len(v), 1))
+            +
             np.reshape(self.q_dirs[i, :], (1, 3)) * np.reshape(sin, (len(v), 1))
         )
 
@@ -236,7 +236,7 @@ class GravitySimulation:
 
     def orbit_periapsis(self, i: int):
         return (self.orbit_parameter(i) / (1 + self.eccs[i, :])) * self.p_dirs[i, :]
-    
+
     def orbit_apoapsis(self, i: int):
         return (self.orbit_parameter(i) / (1 - self.eccs[i, :])) * -self.p_dirs[i, :]
 
@@ -278,7 +278,7 @@ def zoom_factory(ax,base_scale = 2.):
         ax.set_zlim([cur_zlim[0]*scale_factor,
                      cur_zlim[1]*scale_factor])
         plt.draw() # force re-draw
-        
+
     fig = ax.get_figure() # get the figure of interest
     # attach the call back
     fig.canvas.mpl_connect('scroll_event',zoom_fun)
@@ -335,7 +335,7 @@ def do_graph(sim: GravitySimulation):
         # print(sim.w_dirs)
         # print(sim.p_dirs)
         # print(sim.q_dirs)
-        
+
         for i in range(sim.count):
             mass = sim.body_mass(i)
             (px, py, pz) = sim.body_position(i, True)
@@ -364,7 +364,7 @@ def do_graph(sim: GravitySimulation):
         fig.canvas.draw()
 
         tstart = time.time()
-        
+
         plt.pause(1/60)
 
 # sim = GravitySimulation([
@@ -376,37 +376,21 @@ def do_graph(sim: GravitySimulation):
 
 sim = GravitySimulation([
     GravityBody(10000.0, (0.0, 0.0, 0.0), (0.0, 0.0, 0.0)),
-    GravityBody(100.0, (200.0, 0.0, 0.0), (0.0, 230.0, 0.0)),
-    GravityBody(90.0, (220.0, 0.0, 0.0), (0.0, 150.0, 0.0)),
+    GravityBody(100.0, (198.3, 0.0, 26.11), (0.0, 230.0, 0.0)),
+    GravityBody(90.0, (448.3, 0.0, -39.22), (0.0, 150.0, 0.0)),
     GravityBody(80.0, (700.0, 0.0, 0.0), (0.0, 120.0, 0.0)),
 ], do_orbital_elems=True)
 
-# sim.step(0.0)
+sim.step(0.0)
 
-# print("Step 0:")
-# print(sim.positions)
-# print(sim.velocities)
-# print(sim.forces)
-# print(sim.accels)
+for i in range(5):
+    print(f"Step {i}:")
+    print("P: ", sim.positions)
+    print("V: ", sim.velocities)
+    print("A: ", sim.accels)
 
-# start = time.time()
-# sim.step(0.001)
-# print(f"v--- took {time.time()-start} seconds")
+    start = time.time()
+    sim.step(0.1)
+    print(f"v--- took {time.time()-start} seconds")
 
-# print("Step 1:")
-# print(sim.positions)
-# print(sim.velocities)
-# print(sim.forces)
-# print(sim.accels)
-
-# start = time.time()
-# sim.step(0.001)
-# print(f"v--- took {time.time()-start} seconds")
-
-# print("Step 2:")
-# print(sim.positions)
-# print(sim.velocities)
-# print(sim.forces)
-# print(sim.accels)
-
-do_graph(sim)
+# do_graph(sim)
