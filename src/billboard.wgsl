@@ -158,10 +158,14 @@ fn fs_main(
 
     let world_pos = world_normal * radius + center;
 
-    let light_dir = normalize(vec3(1.0, 0.0, 0.0));
-    let light_dot = saturate(dot(light_dir, world_normal));
+    let light_pos = vec3(0.0);
+    let light_dir = normalize(light_pos-world_pos);
+    var light_dot = 1.0;
+    if distance(light_pos, center) >= radius {
+        light_dot = saturate(dot(light_dir, world_normal));
+    }
 
-    let light = vec3(1.0) * saturate(light_dot + 0.05);
+    let light = vec3(1.0) * saturate(light_dot + 0.1);
 
     let clip_pos = camera.proj * camera.view * vec4(world_pos, 1.0);
 

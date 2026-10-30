@@ -1,9 +1,15 @@
 use std::{
     f32::consts::{FRAC_PI_2, PI, TAU},
     hash::{Hash, Hasher},
+    sync::{Arc, atomic::AtomicBool},
+    thread::JoinHandle,
 };
 
+use eframe::{egui_wgpu, wgpu};
 use math::*;
+use parking_lot::{Condvar, Mutex, MutexGuard};
+use rand::RngExt;
+use rand_distr::Distribution;
 
 use crate::sim::Body;
 
@@ -11,7 +17,6 @@ pub mod math;
 pub mod octree;
 /// Octree implementation based on DeadLock's quadtree implementation: https://www.youtube.com/watch?v=nZHjD3cI-EU
 // pub mod octree_old;
-pub mod render;
 pub mod sim;
 
 #[repr(C)]
@@ -63,6 +68,63 @@ fn boring_sim() -> sim::Simulation {
     sim
 }
 
+fn cloud_collapse_sim() -> sim::Simulation {
+    use rand::Rng;
+
+    const N: usize = 5000;
+
+    const BOUND_DIST: f32 = 5000.0;
+
+    const MAX_DIST: f32 = 2000.0;
+    const MIN_DIST: f32 = 500.0;
+
+    const AVG_MASS: f32 = 500.0;
+    const STD_MASS: f32 = 10.0;
+
+    const AVG_DENSITY: f32 = 1.0;
+    const STD_DENSITY: f32 = 0.1;
+
+    const VEL_ALPHA: f32 = 0.05;
+
+    const G: f32 = 10.0;
+
+    fn radius_from_mass_density(mass: f32, density: f32) -> f32 {
+        ((3.0 * mass) / (2.0 * TAU * density)).cbrt()
+    }
+
+    let mut rng = rand::rng();
+
+    let mut sim = sim::Simulation::new(G, 0.5, 0.01, BOUND_DIST);
+
+    let unit_sphere = rand_distr::UnitSphere;
+    let vel_normal = rand_distr::Normal::new(
+        0.0,
+        VEL_ALPHA * G * (AVG_MASS * N as f32) / (5.0 * MAX_DIST),
+    )
+    .unwrap();
+    let dist_uniform = rand_distr::Uniform::new_inclusive(MIN_DIST, MAX_DIST).unwrap();
+    let mass_normal = rand_distr::Normal::new(AVG_MASS, STD_MASS).unwrap();
+    let density_normal = rand_distr::Normal::new(AVG_DENSITY, STD_DENSITY).unwrap();
+
+    for i in 0..N {
+        let mass = mass_normal.sample(&mut rng);
+        let density = density_normal.sample(&mut rng);
+        let radius = ((3.0 * mass) / (2.0 * TAU * density)).cbrt();
+
+        let pos_dir = Vec3A::from_array(unit_sphere.sample(&mut rng));
+        let position = pos_dir * dist_uniform.sample(&mut rng);
+
+        let vel_dir = Vec3A::from_array(unit_sphere.sample(&mut rng))
+            .cross(pos_dir)
+            .normalize_or_zero();
+        let velocity = vel_dir * vel_normal.sample(&mut rng);
+
+        sim.insert(Body::from_lins(position, velocity, mass, radius));
+    }
+
+    sim
+}
+
 fn interesting_sim() -> sim::Simulation {
     use rand::Rng;
 
@@ -70,7 +132,7 @@ fn interesting_sim() -> sim::Simulation {
 
     const BOUND_DIST: f32 = 10000.0;
 
-    const MAX_DIST: f32 = 4000.0;
+    const MAX_DIST: f32 = 3000.0;
     const MIN_DIST: f32 = 500.0;
     const SPACING: f32 = (MAX_DIST - MIN_DIST) / (N as f32);
     const PERTURB: f32 = SPACING * 0.0;
@@ -82,7 +144,7 @@ fn interesting_sim() -> sim::Simulation {
     const MIN_DENSITY: f32 = 0.9;
     const MAX_DENSITY: f32 = 1.1;
 
-    const INCLINE: f32 = 70.0f32.to_radians();
+    const INCLINE: f32 = 50.0f32.to_radians();
 
     const CENTER_MASS: f32 = 10000000.0;
 
@@ -134,20 +196,110 @@ fn interesting_sim() -> sim::Simulation {
     sim
 }
 
-fn main() {
-    let mut output_file = if std::fs::exists("metrics.csv").is_ok_and(std::convert::identity) {
-        Some(std::fs::File::create("metrics.csv").expect("Unable to open file"))
-    } else {
-        None
-    };
-    render::run(|renderer| {
-        let device = renderer.resources().device().clone();
-        let queue = renderer.resources().queue().clone();
+struct OrbitCamera {
+    pub yaw: f32,
+    pub pitch: f32,
+    pub roll: f32,
+    pub dist_exp: f32,
+    pub fov: f32,
+}
+
+impl OrbitCamera {
+    pub fn to_camera_info(&self, center: Vec3A, aspect_ratio: f32) -> CameraInfo {
+        let (z, xy) = self.pitch.sin_cos();
+        let (y, x) = self.yaw.sin_cos();
+
+        let look_dir = -vec3a(x * xy, y * xy, z);
+        let camera_pos = -look_dir * self.dist_exp.exp2() + center;
+        let up_dir = look_dir.cross(Vec3A::Z).normalize().cross(look_dir);
+        let rolled_up_dir = Quat::from_axis_angle(look_dir.to_vec3(), self.roll).mul_vec3a(up_dir);
+
+        let view_matrix = Mat4::look_to_rh(
+            camera_pos.to_vec3(),
+            look_dir.to_vec3(),
+            rolled_up_dir.to_vec3(),
+        );
+        let proj_matrix = Mat4::perspective_infinite_rh(self.fov, aspect_ratio, 1.0);
+
+        CameraInfo {
+            view: view_matrix.to_cols_array(),
+            proj: proj_matrix.to_cols_array(),
+            pos: camera_pos.extend(1.0).to_array(),
+        }
+    }
+}
+
+struct BodyRenderResources {
+    projection_buffer: wgpu::Buffer,
+    bodies_buffer: wgpu::Buffer,
+    pipeline: wgpu::RenderPipeline,
+    bind_group: wgpu::BindGroup,
+}
+
+struct BodyRenderCallback {
+    body_data: Vec<RenderBody>,
+    camera_info: CameraInfo,
+}
+
+impl egui_wgpu::CallbackTrait for BodyRenderCallback {
+    fn prepare(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        screen_descriptor: &egui_wgpu::ScreenDescriptor,
+        egui_encoder: &mut wgpu::CommandEncoder,
+        callback_resources: &mut egui_wgpu::CallbackResources,
+    ) -> Vec<wgpu::CommandBuffer> {
+        let resources = callback_resources.get::<BodyRenderResources>().unwrap();
+        queue.write_buffer(
+            &resources.projection_buffer,
+            0,
+            bytemuck::bytes_of(&self.camera_info),
+        );
+
+        queue.write_buffer(
+            &resources.bodies_buffer,
+            0,
+            bytemuck::cast_slice(self.body_data.as_slice()),
+        );
+
+        queue.submit(None);
+
+        vec![]
+    }
+
+    fn paint(
+        &self,
+        info: egui::PaintCallbackInfo,
+        render_pass: &mut wgpu::RenderPass<'static>,
+        callback_resources: &egui_wgpu::CallbackResources,
+    ) {
+        let resources = callback_resources.get::<BodyRenderResources>().unwrap();
+        render_pass.set_pipeline(&resources.pipeline);
+        render_pass.set_bind_group(0, &resources.bind_group, &[]);
+        render_pass.draw(0..4, 0..self.body_data.len() as u32);
+    }
+}
+
+struct SimulationApp {
+    sim: Arc<Mutex<sim::Simulation>>,
+    paused: Arc<AtomicBool>,
+    running: Arc<AtomicBool>,
+    notifier: Arc<Condvar>,
+    camera: OrbitCamera,
+    tick_thread: JoinHandle<anyhow::Result<()>>,
+}
+
+impl SimulationApp {
+    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        let render_state = cc.wgpu_render_state.as_ref().expect("not using wgpu");
+        let device = &render_state.device;
+        let queue = &render_state.queue;
 
         let mut sim = interesting_sim();
         // let mut sim = boring_sim();
+        // let mut sim = cloud_collapse_sim();
         let max_body_count = sim.indexes.len();
-        let mut body_data = Vec::with_capacity(max_body_count);
 
         let projection_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
@@ -181,9 +333,9 @@ fn main() {
                 ..Default::default()
             },
             depth_stencil: Some(wgpu::DepthStencilState {
-                format: renderer.resources().depth_texture_format(),
-                depth_write_enabled: true,
-                depth_compare: wgpu::CompareFunction::Less,
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Less),
                 stencil: Default::default(),
                 bias: Default::default(),
             }),
@@ -193,7 +345,7 @@ fn main() {
                 entry_point: Some("fs_main"),
                 compilation_options: Default::default(),
                 targets: &[Some(wgpu::ColorTargetState {
-                    format: renderer.resources().surface_texture_format(),
+                    format: render_state.target_format,
                     blend: Some(wgpu::BlendState {
                         color: wgpu::BlendComponent::OVER,
                         alpha: wgpu::BlendComponent::REPLACE,
@@ -201,7 +353,7 @@ fn main() {
                     write_mask: wgpu::ColorWrites::COLOR,
                 })],
             }),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 
@@ -224,159 +376,160 @@ fn main() {
             ],
         });
 
-        if let Some(output) = output_file.as_mut() {
-            use std::io::Write;
-            writeln!(output, "Time (s),Body Count,Angular Momentum (?)").unwrap();
+        render_state
+            .renderer
+            .write()
+            .callback_resources
+            .insert(BodyRenderResources {
+                projection_buffer,
+                bodies_buffer,
+                pipeline,
+                bind_group,
+            });
+
+        let camera = OrbitCamera {
+            yaw: 0.0,
+            pitch: 0.0,
+            roll: 0.0,
+            dist_exp: 8.0,
+            fov: 90.0f32.to_radians(),
+        };
+
+        let paused = Arc::new(AtomicBool::new(false));
+        let running = Arc::new(AtomicBool::new(true));
+        let notifier = Arc::new(Condvar::new());
+
+        let sim = Arc::new(Mutex::new(sim));
+
+        let dt = std::time::Duration::from_secs_f32(60.0f32.recip());
+
+        let tick_thread = {
+            let sim = sim.clone();
+            let paused = paused.clone();
+            let running = running.clone();
+            let notifier = notifier.clone();
+            std::thread::spawn(move || {
+                let mut start = std::time::Instant::now();
+                let mut sim_lock = sim.lock();
+                while running.load(std::sync::atomic::Ordering::Relaxed) {
+                    if !paused.load(std::sync::atomic::Ordering::Relaxed) {
+                        sim_lock.step(dt.as_secs_f32());
+                    }
+
+                    notifier.wait_until(&mut sim_lock, start + dt);
+                    start = std::time::Instant::now();
+                }
+
+                Ok(())
+            })
+        };
+
+        Self {
+            sim,
+            camera,
+            paused,
+            running,
+            notifier,
+            tick_thread,
         }
+    }
+}
 
-        const SQRT_3: f32 = 1.7320508;
+impl eframe::App for SimulationApp {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        const RECORD_INTERVAL: f32 = 0.5;
+        let sim_lock = self.sim.lock();
 
-        let mut total_time = 0.0f32;
-
-        let mut last_record_time = 0.0f32;
-
-        let mut camera_dist_exp = 8.0f32;
-        let mut camera_yaw = 0.0;
-        let mut camera_pitch = 0.0;
-
-        let mut time = std::time::Instant::now();
-        renderer.set_render_callback(move |renderer, ctx| {
-            const RECORD_INTERVAL: f32 = 0.5;
-            let dt = time.elapsed().as_secs_f32();
-            time = std::time::Instant::now();
-            total_time += dt;
-            sim.step(dt);
-
-            // if renderer.mouse_button_state(winit::event::MouseButton::Right) {
-            //     sim.step(0.01);
-            // }
-
-            body_data.clear();
-            for handle in sim.handles.iter() {
-                let slot = handle.slot() as usize;
-                let mut hasher = std::hash::DefaultHasher::new();
-                handle.hash(&mut hasher);
-                let hash = hasher.finish();
-                let hash = (hash as u16)
-                    ^ ((hash >> 16) as u16)
-                    ^ ((hash >> 32) as u16)
-                    ^ ((hash >> 48) as u16);
-                let ang = (hash as f32) / (u16::MAX as f32);
-                let r = (ang * 6.0 - 3.0).abs() - 1.0;
-                let g = 2.0 - (ang * 6.0 - 2.0).abs();
-                let b = 2.0 - (ang * 6.0 - 4.0).abs();
-
-                body_data.push(RenderBody {
-                    sphere: sim.positions[slot].extend(sim.radii[slot]).to_array(),
-                    color: vec4(r, g, b, 1.0).to_array(),
-                });
-            }
-
-            if total_time - last_record_time >= RECORD_INTERVAL {
-                last_record_time += RECORD_INTERVAL;
-                if let Some(output) = output_file.as_mut() {
-                    use std::io::Write;
-                    writeln!(
-                        output,
-                        "{:.2},{},{:.8e}",
-                        total_time,
-                        sim.indexes.len(),
-                        sim.total_angular_momentum()
-                    )
-                    .unwrap();
+        let mut body_data = Vec::new();
+        for handle in sim_lock.handles.iter() {
+            fn hsv_to_rgb(h: f32, s: f32, v: f32) -> Vec3 {
+                let sector = ((h % 1.0) * 6.0);
+                let c = v * s;
+                let x = c * (1.0 - ((sector % 2.0) - 1.0).abs());
+                let m = v - c;
+                match sector as u8 {
+                    0 => vec3(c, x, 0.0) * m,
+                    1 => vec3(x, c, 0.0) * m,
+                    2 => vec3(0.0, c, x) * m,
+                    3 => vec3(0.0, x, c) * m,
+                    4 => vec3(x, 0.0, c) * m,
+                    5 => vec3(c, 0.0, x) * m,
+                    _ => unreachable!(),
                 }
             }
 
-            let camera_pos = {
+            let slot = handle.slot() as usize;
+            let mut hasher = std::hash::DefaultHasher::new();
+            handle.hash(&mut hasher);
+            let hash = hasher.finish();
+            let hash = (hash as u16)
+                ^ ((hash >> 16) as u16)
+                ^ ((hash >> 32) as u16)
+                ^ ((hash >> 48) as u16);
+            let ang = (hash as f32) / (u16::MAX as f32);
+            let density = sim_lock.masses[slot] / (sim_lock.radii[slot].powi(3) * PI * 4.0 / 3.0);
+            let color = hsv_to_rgb(ang, density / (density + 3.0), 2.0);
+
+            body_data.push(RenderBody {
+                sphere: sim_lock.positions[slot]
+                    .extend(sim_lock.radii[slot])
+                    .to_array(),
+                color: color.extend(1.0).to_array(),
+            });
+        }
+
+        egui::CentralPanel::default().show(ui, |ui| {
+            egui::Frame::canvas(ui.style()).show(ui, |ui| {
                 const CURSOR_SENSE_YAW: f32 = 0.01;
                 const CURSOR_SENSE_PITCH: f32 = 0.01;
                 const SCROLL_SENSE: f32 = 0.0625;
-                if renderer.mouse_button_state(winit::event::MouseButton::Left) {
-                    let cursor_delta = renderer.cursor_delta();
-                    camera_yaw = (camera_yaw - cursor_delta.x * CURSOR_SENSE_YAW) % TAU;
-                    camera_pitch = (camera_pitch + cursor_delta.y * CURSOR_SENSE_PITCH)
-                        .clamp(-FRAC_PI_2 + f32::EPSILON, FRAC_PI_2 - f32::EPSILON);
+
+                let (rect, response) = ui
+                    .allocate_at_least(ui.available_size(), egui::Sense::DRAG | egui::Sense::HOVER);
+
+                self.camera.yaw =
+                    (self.camera.yaw + response.drag_delta().x * CURSOR_SENSE_YAW) % TAU;
+                self.camera.pitch = (self.camera.pitch
+                    - response.drag_delta().y * CURSOR_SENSE_PITCH)
+                    .clamp(-FRAC_PI_2 + f32::EPSILON, FRAC_PI_2 - f32::EPSILON);
+                if response.hovered() {
+                    self.camera.dist_exp +=
+                        ui.input(|input| input.smooth_scroll_delta().y) * SCROLL_SENSE;
                 }
-                let scroll_delta = renderer.scroll_delta();
-                camera_dist_exp += scroll_delta.y * SCROLL_SENSE;
 
-                let (z, xy) = camera_pitch.sin_cos();
-                let (y, x) = camera_yaw.sin_cos();
+                let aspect_ratio = rect.width() / rect.height();
 
-                vec3a(x * xy, y * xy, z) * camera_dist_exp.exp2()
-            };
+                let center = sim_lock.center_of_mass;
 
-            let win_dim = renderer.resources().surface_texture_size();
-            let (win_width, win_height) = (win_dim.x, win_dim.y);
+                let camera_info = self.camera.to_camera_info(center, aspect_ratio);
 
-            let aspect_ratio = (win_width as f32) / (win_height as f32);
-
-            let center = sim.center_of_mass;
-
-            let camera_pos = (center + camera_pos).to_vec3();
-            let view_matrix = Mat4::look_at_rh(camera_pos, center.into(), Vec3::Z);
-            let proj_matrix =
-                Mat4::perspective_infinite_rh(90.0f32.to_degrees(), aspect_ratio, 1.0);
-
-            queue.write_buffer(
-                &projection_buffer,
-                0,
-                bytemuck::bytes_of(&CameraInfo {
-                    view: view_matrix.to_cols_array(),
-                    proj: proj_matrix.to_cols_array(),
-                    pos: camera_pos.extend(0.0).to_array(),
-                }),
-            );
-
-            queue.write_buffer(
-                &bodies_buffer,
-                0,
-                bytemuck::cast_slice(body_data.as_slice()),
-            );
-
-            queue.submit(None);
-
-            {
-                let mut render_pass =
-                    ctx.command_encoder
-                        .begin_render_pass(&wgpu::RenderPassDescriptor {
-                            label: None,
-                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                                view: ctx.surface_texture_view,
-                                depth_slice: None,
-                                resolve_target: None,
-                                ops: wgpu::Operations {
-                                    load: wgpu::LoadOp::Clear(wgpu::Color {
-                                        r: 0.0,
-                                        g: 0.0,
-                                        b: 0.0,
-                                        a: 1.0,
-                                    }),
-                                    store: wgpu::StoreOp::Store,
-                                },
-                            })],
-                            depth_stencil_attachment: Some(
-                                wgpu::RenderPassDepthStencilAttachment {
-                                    view: ctx.depth_texture_view,
-                                    depth_ops: Some(wgpu::Operations {
-                                        load: wgpu::LoadOp::Clear(1.0),
-                                        store: wgpu::StoreOp::Store,
-                                    }),
-                                    stencil_ops: None,
-                                },
-                            ),
-                            timestamp_writes: None,
-                            occlusion_query_set: None,
-                        });
-
-                render_pass.set_pipeline(&pipeline);
-                render_pass.set_bind_group(0, &bind_group, &[]);
-                render_pass.draw(0..4, 0..body_data.len() as u32);
-            }
-            Ok(())
+                ui.painter().add(egui_wgpu::Callback::new_paint_callback(
+                    rect,
+                    BodyRenderCallback {
+                        body_data,
+                        camera_info,
+                    },
+                ));
+            });
         });
-        Ok(())
-    });
+
+        ui.ctx().request_repaint();
+    }
+}
+
+fn main() -> anyhow::Result<()> {
+    let native_options = eframe::NativeOptions {
+        depth_buffer: 32,
+        renderer: eframe::Renderer::Wgpu,
+        ..Default::default()
+    };
+    eframe::run_native(
+        "newtonian-gravity",
+        native_options,
+        Box::new(|cc| Ok(Box::new(SimulationApp::new(cc)))),
+    )?;
+
+    Ok(())
 }
 
 #[test]

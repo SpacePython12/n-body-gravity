@@ -11,12 +11,13 @@ strip = false
 anyhow = "1.0.100"
 bytemuck = "1.24.0"
 crossbeam = { version = "0.8.4", features = ["crossbeam-channel"] }
+eframe = "0.37.0"
+egui = "0.37.0"
 glam = { version = "0.30.8", features = ["bytemuck"] }
 glamx = "0.3.0"
 parking_lot = "0.12.5"
 pollster = "0.4.0"
-rand = "0.9.2"
+rand = "0.10.0"
+rand_distr = "0.6.0"
 rayon = "1.11.0"
 thunderdome = "0.6.1"
-wgpu = "27.0.1"
-winit = "0.30.12"

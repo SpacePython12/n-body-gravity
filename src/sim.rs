@@ -221,7 +221,7 @@ pub struct Simulation {
 
     pub total_mass: f32,
     pub center_of_mass: Vec3A,
-    pub total_linear_momentum: Vec3A,
+    pub center_of_mass_velocity: Vec3A,
     pub total_angular_momentum: Vec3A,
     pub total_inertia: Mat3A,
     pub max_dist_sq: f32,
@@ -242,7 +242,7 @@ impl Simulation {
 
             total_mass: 0.0,
             center_of_mass: Vec3A::ZERO,
-            total_linear_momentum: Vec3A::ZERO,
+            center_of_mass_velocity: Vec3A::ZERO,
             total_angular_momentum: Vec3A::ZERO,
             total_inertia: Mat3A::ZERO,
             max_dist_sq: max_cog_dist * max_cog_dist,
@@ -426,9 +426,20 @@ impl Simulation {
 
         self.total_mass = total_mass;
         self.center_of_mass = center_of_mass;
-        self.total_linear_momentum = lin_moment;
+        self.center_of_mass_velocity = lin_moment / total_mass;
         self.total_angular_momentum = ang_moment;
         self.total_inertia = inertia;
+    }
+
+    fn center_system(&mut self) {
+        self.positions
+            .par_iter_mut()
+            .for_each(|pos| *pos -= self.center_of_mass);
+        self.linvels
+            .par_iter_mut()
+            .for_each(|vel| *vel -= self.center_of_mass_velocity);
+        self.center_of_mass = Vec3A::ZERO;
+        self.center_of_mass_velocity = Vec3A::ZERO;
     }
 
     fn leapfrog_integrate(&mut self, dt: f32) {
@@ -566,7 +577,7 @@ impl Simulation {
             .filter(|handle| {
                 let slot = handle.slot() as usize;
                 let dist_sq = self.center_of_mass.distance_squared(self.positions[slot]);
-                if dist_sq > self.max_dist_sq * 16.0 {
+                if dist_sq > self.max_dist_sq * 4.0 {
                     true
                 } else if dist_sq > self.max_dist_sq {
                     let dist = dist_sq.sqrt();
@@ -604,5 +615,7 @@ impl Simulation {
         self.resolve_out_of_bounds();
 
         self.calc_cog_state();
+
+        self.center_system();
     }
 }
